@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.101.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.100.0...v0.101.0) (2026-11-02)
+
+
+### Features
+
+* stream the output of v2 background commands ([#1512](https://github.com/agentclientprotocol/claude-agent-acp/issues/1512)) ([53e3eec](https://github.com/agentclientprotocol/claude-agent-acp/commit/53e3eec0134209654f53c46f319aaac851b8fff0))
+
 ## [0.100.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.99.1...v0.100.0) (2026-11-02)
 
 
