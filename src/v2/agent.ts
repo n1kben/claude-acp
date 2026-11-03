@@ -177,7 +177,7 @@ export function v2AgentApp(
       });
       return { ...response, configOptions: options };
     })
-    .onRequest(v2.methods.agent.session.prompt, ({ params, requestId }) =>
+    .onRequest(v2.methods.agent.session.prompt, ({ params, requestId, signal }) =>
       v2Prompt(
         agent,
         params,
@@ -185,6 +185,7 @@ export function v2AgentApp(
           void client.send({ sessionId: params.sessionId, update });
         },
         deliveries.take(requestId),
+        signal,
       ),
     )
     .onRequest(v2.methods.agent.terminal.cancel, async ({ params }) => {

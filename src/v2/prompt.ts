@@ -32,13 +32,16 @@ import { parsePromptDelivery } from "./prompt-delivery.js";
  * `delivery` is the request's raw `delivery` field (see `prompt-delivery.ts`).
  * With `steer`, the prompt joins the running turn instead of starting its own
  * (see `ClaudeAcpAgent.steerTurn`), and answers the same way: once Claude
- * Code takes it in, with its `user_message` first.
+ * Code takes it in, with its `user_message` first. A steer whose request
+ * `signal` aborts before then (`$/cancel_request`, or the connection closed)
+ * is withdrawn while it still can be, and fails with `-32800`.
  */
 export function v2Prompt(
   agent: ClaudeAcpAgent,
   params: v2.PromptRequest,
   send: (update: v2.SessionUpdate) => void,
   delivery?: unknown,
+  signal?: AbortSignal,
 ): Promise<v2.PromptResponse> {
   return new Promise((resolve, reject) => {
     let inserted = false;
@@ -72,7 +75,9 @@ export function v2Prompt(
       reject(error);
       return;
     }
-    (steer ? agent.steerTurn(request, events) : agent.startTurn(request, events)).catch(reject);
+    (steer ? agent.steerTurn(request, events, signal) : agent.startTurn(request, events)).catch(
+      reject,
+    );
   });
 }
 

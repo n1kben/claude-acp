@@ -14,7 +14,8 @@
  * Whichever comes first reports {@link TurnEvents.inserted}; the others find
  * nothing to report. A steer the turn ended without taking in is handed back
  * by {@link SteerInsertions.takeForTurn}, so the agent can start it as the
- * next turn.
+ * next turn. A steer the client withdrew is removed with
+ * {@link SteerInsertions.take}.
  *
  * `_session/steering` (ACP v1) steers are not tracked: that request answers as
  * soon as the message is pushed.
@@ -50,6 +51,18 @@ export class SteerInsertions {
     if (!steer) return;
     this.pending.delete(uuid);
     steer.events.inserted(uuid);
+  }
+
+  /** The pending steer `uuid`, or `undefined` once it was reported or taken. */
+  get(uuid: string): PendingSteer | undefined {
+    return this.pending.get(uuid);
+  }
+
+  /** Removes and returns the pending steer `uuid`, without reporting it. */
+  take(uuid: string): PendingSteer | undefined {
+    const steer = this.pending.get(uuid);
+    this.pending.delete(uuid);
+    return steer;
   }
 
   /**

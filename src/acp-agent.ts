@@ -4628,8 +4628,11 @@ export class ClaudeAcpAgent {
    * - The turn ends before Claude Code takes the steer in (a cancel, or a
    *   failure): the steer starts the next turn, as a prompt (see
    *   {@link restartPendingSteers}).
+   * - `signal` aborts before Claude Code takes the steer in (the client
+   *   withdrew it with `$/cancel_request`, or its connection closed): the
+   *   steer is withdrawn when it still can be (see {@link withdrawSteer}).
    */
-  async steerTurn(params: PromptRequest, events: TurnEvents): Promise<void> {
+  async steerTurn(params: PromptRequest, events: TurnEvents, signal?: AbortSignal): Promise<void> {
     const sessionId = params.sessionId;
     const session = await this.steerableSession(sessionId);
     // Same check as `steer`, in the same synchronous section as the push.
@@ -4638,7 +4641,7 @@ export class ClaudeAcpAgent {
       await this.startTurn(params, events);
       return;
     }
-    await this.injectSteer(
+    const steeredUuid = await this.injectSteer(
       sessionId,
       session,
       turnInFlight,
@@ -4646,6 +4649,53 @@ export class ClaudeAcpAgent {
       (session.openUserInputs?.size ?? 0) > 0 ? STEER_PRIORITY_LATER : STEER_PRIORITY_NEXT,
       { request: params, events, turn: turnInFlight },
     );
+    if (!signal) return;
+    const withdraw = () =>
+      this.withdrawSteer(sessionId, steeredUuid).catch((error) =>
+        this.logger.error(
+          `Session ${sessionId}: could not withdraw the steer ${steeredUuid}:`,
+          error,
+        ),
+      );
+    if (signal.aborted) void withdraw();
+    else signal.addEventListener("abort", () => void withdraw(), { once: true });
+  }
+
+  /**
+   * Withdraws the pending steer `uuid`: drops it from Claude Code's queue and
+   * ends its prompt `cancelled` (-32800 on v2). Does nothing once Claude Code
+   * took it in, which then answers the prompt as usual.
+   *
+   * Only while the steered turn's running cycle has no result yet: the idle
+   * after that result then settles the turn. Once a result passed (or the
+   * steer resumed a turn held for its subagents), that idle may already have
+   * been swallowed while the steer was outstanding, and nothing would settle
+   * the turn without the steer: the steer then stays, and Claude Code takes it
+   * in. Residual: a result and its idle that arrive while the drop is in
+   * flight leave the turn to the next prompt or cancel, as the steer lane's
+   * other residuals do. Claude Code dequeues a queued message as soon as a
+   * turn ends, so it reports such a steer not queued, and nothing is dropped.
+   */
+  private async withdrawSteer(sessionId: string, uuid: string): Promise<void> {
+    const steer = this.steerInsertions.get(uuid);
+    const session = this.sessions[sessionId];
+    if (!steer || !session || session.queryClosed) return;
+    const turn = steer.turn as Turn;
+    if (turn.settled || turn.steeredSettle !== undefined || turn.steeredAwaitingResult) return;
+    const cancelAsyncMessage = (session.query as Query & { cancelAsyncMessage?: unknown })
+      .cancelAsyncMessage;
+    if (typeof cancelAsyncMessage !== "function") return;
+    // `false` once Claude Code dequeued the message: it is being taken in.
+    const dropped = await (cancelAsyncMessage as (uuid: string) => Promise<unknown>).call(
+      session.query,
+      uuid,
+    );
+    if (dropped !== true || !this.steerInsertions.take(uuid)) return;
+    // With no steer left, the turn settles at the idle after its result, as
+    // the steer lane does (see `isSteeredSettleReady`).
+    turn.steeredEchoes?.delete(uuid);
+    turn.steeredUuids?.delete(uuid);
+    steer.events.ended({ stopReason: "cancelled" });
   }
 
   /** The live session `sessionId` to steer, respawned if it was signed out. */
@@ -4676,7 +4726,7 @@ export class ClaudeAcpAgent {
     request: PromptRequest,
     priority: SteerPriority,
     pending?: PendingSteer,
-  ): Promise<void> {
+  ): Promise<string> {
     const userMessage = promptToClaude({ sessionId, prompt: request.prompt });
     const steeredUuid = randomUUID();
     userMessage.uuid = steeredUuid;
@@ -4703,6 +4753,7 @@ export class ClaudeAcpAgent {
     session.input.push(userMessage);
     const firstText = request.prompt[0]?.type === "text" ? request.prompt[0].text : "";
     await this.publishGoalFromPrompt(sessionId, firstText, steeredUuid);
+    return steeredUuid;
   }
 
   /**

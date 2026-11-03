@@ -2986,6 +2986,79 @@ describe("ACP v2 prompts", () => {
       ]);
     });
 
+    it.each([
+      { queued: true, outcome: "fails with -32800, and the turn ends at its own result" },
+      { queued: false, outcome: "answers when Claude Code takes the steer in" },
+    ])(
+      "withdraws a steer with $/cancel_request: still queued $queued $outcome",
+      async ({ queued }) => {
+        const dropped: string[] = [];
+        sdk.cancelAsyncMessage = async (uuid) => {
+          dropped.push(uuid);
+          return queued;
+        };
+        const withdrawn = Promise.withResolvers<void>();
+        const received: SDKUserMessage[] = [];
+        sdk.run = async function* (prompts, options) {
+          const input = prompts[Symbol.asyncIterator]();
+          const first = (await input.next()).value as SDKUserMessage;
+          received.push(first);
+          yield echo(options, first);
+          yield toolUseMessage(options, "toolu_sleep", "Bash", { command: "sleep 6" });
+          atToolCall.resolve();
+          const steer = (await input.next()).value as SDKUserMessage;
+          received.push(steer);
+          yield lifecycle(options, steer.uuid, "queued");
+          await withdrawn.promise;
+          yield toolResult(options, "toolu_sleep", "done");
+          if (!queued) yield echo(options, steer);
+          yield assistantText(options, "FIRST");
+          yield result(options, {
+            user_message_uuid: first.uuid,
+            user_message_uuids: queued ? [first.uuid] : [first.uuid, steer.uuid],
+          });
+          yield idleState(options);
+          while (!(await input.next()).done);
+        };
+        const client = v2Client();
+        await client.app.connectWith(connectRouter(), async (agent) => {
+          await initializeV2(agent);
+          const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+          await agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: text("go") });
+          await atToolCall.promise;
+          const withdraw = new AbortController();
+          const steered = agent.request(
+            v2.methods.agent.session.prompt,
+            steerPrompt(sessionId, "never mind"),
+            { cancellationSignal: withdraw.signal },
+          );
+          // Settles the assertion below before `steered` is awaited.
+          steered.catch(() => {});
+          await vi.waitFor(() => expect(received).toHaveLength(2));
+          withdraw.abort();
+          await vi.waitFor(() => expect(dropped).toEqual([received[1].uuid]));
+          withdrawn.resolve();
+
+          if (queued) {
+            await expect(steered).rejects.toMatchObject({ code: -32800 });
+          } else {
+            expect(await steered).toEqual({ messageId: received[1].uuid });
+          }
+          await vi.waitFor(() =>
+            expect(turnTrace(client.sessionUpdates)).toContain("idle end_turn"),
+          );
+          await client.authUpdate(1);
+        });
+
+        expect(client.updates("user_message").map((update) => update.messageId)).toEqual(
+          queued ? [received[0].uuid] : [received[0].uuid, received[1].uuid],
+        );
+        expect(turnTrace(client.sessionUpdates).filter((s) => s.startsWith("idle"))).toEqual([
+          "idle end_turn",
+        ]);
+      },
+    );
+
     it.each([["queue"], ["now"], [1]])(
       "rejects delivery %j with invalid params before inserting the prompt",
       async (delivery) => {
