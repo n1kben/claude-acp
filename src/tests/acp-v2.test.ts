@@ -59,6 +59,8 @@ const sdk = vi.hoisted(() => ({
   interrupt: async (): Promise<void> => {},
   /** Claude Code stops one task, as `cancel()` does for a child session. */
   stopTask: async (_taskId: string): Promise<void> => {},
+  /** Claude Code drops a queued user message, as `cancel()` does for a pending steer. */
+  cancelAsyncMessage: async (_uuid: string): Promise<boolean> => true,
   /** The query is closed, as `session/close` closes it. */
   close: (): void => {},
   initializationResult: async (): Promise<Record<string, unknown>> => ({
@@ -103,6 +105,7 @@ vi.mock("@anthropic-ai/claude-agent-sdk", async () => {
         mcpAuthenticate: (serverName: string) => sdk.mcpAuthenticate(serverName),
         interrupt: () => sdk.interrupt(),
         stopTask: (taskId: string) => sdk.stopTask(taskId),
+        cancelAsyncMessage: (uuid: string) => sdk.cancelAsyncMessage(uuid),
         close: () => sdk.close(),
       });
       return Object.assign(messages, controls);
@@ -2692,6 +2695,390 @@ describe("ACP v2 prompts", () => {
       await authUpdate(1);
     });
     expect(echoed).toEqual([]);
+  });
+
+  // `delivery` on `session/prompt`, per the steer and queue RFD
+  // (agentclientprotocol/agent-client-protocol#1261). The frames follow what
+  // Claude Code 2.1.316 sent for a `next` message pushed during a foreground
+  // Bash call: `queued` at once, then, once the call returned, the echo and
+  // `started`, the answer, and one result that names both messages.
+  describe("delivery: steer", () => {
+    /** Resolves once the agent has read the first prompt's Bash call. */
+    let atToolCall = Promise.withResolvers<void>();
+    beforeEach(() => {
+      atToolCall = Promise.withResolvers<void>();
+    });
+
+    const steerPrompt = (sessionId: string, value: string) =>
+      // The SDK's `PromptRequest` type does not have `delivery` yet.
+      ({ sessionId, prompt: text(value), delivery: "steer" }) as v2.PromptRequest;
+
+    function echo(options: Options, message: SDKUserMessage) {
+      return {
+        type: "user",
+        message: message.message,
+        parent_tool_use_id: null,
+        uuid: message.uuid,
+        session_id: options.sessionId,
+        isReplay: true,
+      };
+    }
+
+    function lifecycle(options: Options, commandUuid: string | undefined, state: string) {
+      return {
+        type: "command_lifecycle",
+        command_uuid: commandUuid,
+        state,
+        uuid: randomUUID(),
+        session_id: options.sessionId,
+      };
+    }
+
+    function toolResult(options: Options, toolUseId: string, content: string) {
+      return {
+        type: "user",
+        message: {
+          role: "user",
+          content: [{ type: "tool_result", tool_use_id: toolUseId, content }],
+        },
+        parent_tool_use_id: null,
+        uuid: randomUUID(),
+        session_id: options.sessionId,
+      };
+    }
+
+    /**
+     * Claude Code runs the first prompt's Bash call until `toolDone`, takes the
+     * steer into the turn after the call, and answers both in one result.
+     * Returns the user messages that Claude Code received.
+     */
+    function scriptSteeredTurn(toolDone: Promise<void>): SDKUserMessage[] {
+      const received: SDKUserMessage[] = [];
+      sdk.run = async function* (prompts, options) {
+        const input = prompts[Symbol.asyncIterator]();
+        const first = (await input.next()).value as SDKUserMessage;
+        received.push(first);
+        yield lifecycle(options, first.uuid, "queued");
+        yield lifecycle(options, first.uuid, "started");
+        yield echo(options, first);
+        yield toolUseMessage(options, "toolu_sleep", "Bash", { command: "sleep 6" });
+        // The agent has read the tool call once it asks for the next message.
+        atToolCall.resolve();
+        const steer = (await input.next()).value as SDKUserMessage;
+        received.push(steer);
+        yield lifecycle(options, steer.uuid, "queued");
+        await toolDone;
+        yield toolResult(options, "toolu_sleep", "done");
+        yield echo(options, steer);
+        yield lifecycle(options, steer.uuid, "started");
+        yield assistantText(options, "FIRST SECOND");
+        yield lifecycle(options, steer.uuid, "completed");
+        yield result(options, {
+          user_message_uuid: first.uuid,
+          user_message_uuids: [first.uuid, steer.uuid],
+        });
+        yield lifecycle(options, first.uuid, "completed");
+        yield idleState(options);
+        while (!(await input.next()).done);
+      };
+      return received;
+    }
+
+    it.each([
+      { open: "no request", inputOpen: false, priority: "next" },
+      { open: "a permission request", inputOpen: true, priority: "later" },
+    ])(
+      "joins the running turn at priority $priority with $open open, and answers once Claude Code takes it in",
+      async ({ inputOpen, priority }) => {
+        const toolDone = Promise.withResolvers<void>();
+        const received = scriptSteeredTurn(toolDone.promise);
+        const client = v2Client();
+        await client.app.connectWith(connectRouter(), async (agent) => {
+          await initializeV2(agent);
+          const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+          await agent.request(v2.methods.agent.session.prompt, {
+            sessionId,
+            prompt: text("Run sleep, then say FIRST."),
+          });
+          await atToolCall.promise;
+          const session = agents[0].sessions[sessionId]!;
+          if (inputOpen) session.openUserInputs = new Set([{}]);
+          let answered = false;
+          const steered = agent
+            .request(v2.methods.agent.session.prompt, steerPrompt(sessionId, "Also say SECOND."))
+            .finally(() => (answered = true));
+          await vi.waitFor(() => expect(received).toHaveLength(2));
+          session.openUserInputs = undefined;
+          // Pushed into the turn, not queued as a turn of its own.
+          expect(received[1].priority).toBe(priority);
+          expect(session.turnQueue).toHaveLength(1);
+          // Not answered while the Bash call runs: Claude Code has not taken it in.
+          await new Promise((resolve) => setTimeout(resolve, 20));
+          expect(answered).toBe(false);
+
+          toolDone.resolve();
+          expect(await steered).toEqual({ messageId: received[1].uuid });
+          await vi.waitFor(() =>
+            expect(turnTrace(client.sessionUpdates)).toContain("idle end_turn"),
+          );
+          await client.authUpdate(1);
+        });
+
+        // One turn: the steer's message lands inside it, before the answer.
+        expect(turnTrace(client.sessionUpdates)).toEqual([
+          "user_message",
+          "running",
+          "user_message",
+          "agent_message_chunk",
+          "idle end_turn",
+        ]);
+        expect(client.updates("user_message")).toEqual([
+          {
+            sessionUpdate: "user_message",
+            messageId: received[0].uuid,
+            content: text("Run sleep, then say FIRST."),
+          },
+          {
+            sessionUpdate: "user_message",
+            messageId: received[1].uuid,
+            content: text("Also say SECOND."),
+          },
+        ]);
+      },
+    );
+
+    it("answers a steer that Claude Code did not echo at the result that names it", async () => {
+      const received: SDKUserMessage[] = [];
+      sdk.run = async function* (prompts, options) {
+        const input = prompts[Symbol.asyncIterator]();
+        const first = (await input.next()).value as SDKUserMessage;
+        received.push(first);
+        yield echo(options, first);
+        yield toolUseMessage(options, "toolu_sleep", "Bash", { command: "sleep 6" });
+        // The agent has read the tool call once it asks for the next message.
+        atToolCall.resolve();
+        const steer = (await input.next()).value as SDKUserMessage;
+        received.push(steer);
+        yield toolResult(options, "toolu_sleep", "done");
+        yield assistantText(options, "FIRST SECOND");
+        yield result(options, {
+          user_message_uuid: first.uuid,
+          user_message_uuids: [first.uuid, steer.uuid],
+        });
+        yield idleState(options);
+        while (!(await input.next()).done);
+      };
+      const client = v2Client();
+      await client.app.connectWith(connectRouter(), async (agent) => {
+        await initializeV2(agent);
+        const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+        await agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: text("go") });
+        await atToolCall.promise;
+        expect(
+          await agent.request(v2.methods.agent.session.prompt, steerPrompt(sessionId, "steer")),
+        ).toEqual({ messageId: received[1]?.uuid });
+        await vi.waitFor(() => expect(turnTrace(client.sessionUpdates)).toContain("idle end_turn"));
+        await client.authUpdate(1);
+      });
+
+      expect(client.updates("user_message").map((update) => update.messageId)).toEqual(
+        received.map((message) => message.uuid),
+      );
+    });
+
+    it("starts a turn, as a prompt does, when no turn is running", async () => {
+      const echoed = scriptTurns(async function* (options) {
+        yield assistantText(options, "Hello");
+        yield result(options);
+        yield idleState(options);
+      });
+      const client = v2Client();
+      await client.app.connectWith(connectRouter(), async (agent) => {
+        await initializeV2(agent);
+        const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+        expect(
+          await agent.request(v2.methods.agent.session.prompt, steerPrompt(sessionId, "hi")),
+        ).toEqual({ messageId: echoed[0] });
+        await vi.waitFor(() => expect(turnTrace(client.sessionUpdates)).toContain("idle end_turn"));
+        await client.authUpdate(1);
+      });
+
+      expect(turnTrace(client.sessionUpdates)).toEqual([
+        "user_message",
+        "running",
+        "agent_message_chunk",
+        "idle end_turn",
+      ]);
+    });
+
+    it("starts the next turn with a steer that a cancel stopped the turn before", async () => {
+      const interrupted = Promise.withResolvers<void>();
+      sdk.interrupt = async () => interrupted.resolve();
+      const dropped: string[] = [];
+      sdk.cancelAsyncMessage = async (uuid) => {
+        dropped.push(uuid);
+        return true;
+      };
+      const received: SDKUserMessage[] = [];
+      sdk.run = async function* (prompts, options) {
+        const input = prompts[Symbol.asyncIterator]();
+        const first = (await input.next()).value as SDKUserMessage;
+        received.push(first);
+        yield echo(options, first);
+        yield toolUseMessage(options, "toolu_sleep", "Bash", { command: "sleep 60" });
+        atToolCall.resolve();
+        const steer = (await input.next()).value as SDKUserMessage;
+        received.push(steer);
+        yield lifecycle(options, steer.uuid, "queued");
+        await interrupted.promise;
+        // The cancel dropped the steer from Claude Code's queue.
+        yield lifecycle(options, steer.uuid, "cancelled");
+        yield toolResult(options, "toolu_sleep", "Interrupted");
+        yield result(options);
+        yield idleState(options);
+        // The steer again, as a prompt of its own.
+        const restarted = (await input.next()).value as SDKUserMessage;
+        received.push(restarted);
+        yield echo(options, restarted);
+        yield assistantText(options, "Steered");
+        yield result(options);
+        yield idleState(options);
+        while (!(await input.next()).done);
+      };
+      const client = v2Client();
+      await client.app.connectWith(connectRouter(), async (agent) => {
+        await initializeV2(agent);
+        const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+        await agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: text("go") });
+        await atToolCall.promise;
+        const steered = agent.request(
+          v2.methods.agent.session.prompt,
+          steerPrompt(sessionId, "Use the retry helper."),
+        );
+        await vi.waitFor(() => expect(received).toHaveLength(2));
+
+        await agent.notify(v2.methods.agent.session.cancel, { sessionId });
+
+        expect(await steered).toEqual({ messageId: received[2]?.uuid });
+        await vi.waitFor(() =>
+          expect(turnTrace(client.sessionUpdates)).toContain("agent_message_chunk"),
+        );
+        await vi.waitFor(() =>
+          expect(turnTrace(client.sessionUpdates).filter((s) => s.startsWith("idle"))).toHaveLength(
+            2,
+          ),
+        );
+        await client.authUpdate(1);
+      });
+
+      expect(dropped).toContain(received[1].uuid);
+      // The restarted steer is an ordinary prompt with the steer's content.
+      expect(received[2].priority).toBeUndefined();
+      expect(received[2].message).toEqual(received[1].message);
+      expect(turnTrace(client.sessionUpdates)).toEqual([
+        "user_message",
+        "running",
+        "idle cancelled",
+        "user_message",
+        "running",
+        "agent_message_chunk",
+        "idle end_turn",
+      ]);
+    });
+
+    it.each([
+      { queued: true, outcome: "fails with -32800, and the turn ends at its own result" },
+      { queued: false, outcome: "answers when Claude Code takes the steer in" },
+    ])(
+      "withdraws a steer with $/cancel_request: still queued $queued $outcome",
+      async ({ queued }) => {
+        const dropped: string[] = [];
+        sdk.cancelAsyncMessage = async (uuid) => {
+          dropped.push(uuid);
+          return queued;
+        };
+        const withdrawn = Promise.withResolvers<void>();
+        const received: SDKUserMessage[] = [];
+        sdk.run = async function* (prompts, options) {
+          const input = prompts[Symbol.asyncIterator]();
+          const first = (await input.next()).value as SDKUserMessage;
+          received.push(first);
+          yield echo(options, first);
+          yield toolUseMessage(options, "toolu_sleep", "Bash", { command: "sleep 6" });
+          atToolCall.resolve();
+          const steer = (await input.next()).value as SDKUserMessage;
+          received.push(steer);
+          yield lifecycle(options, steer.uuid, "queued");
+          await withdrawn.promise;
+          yield toolResult(options, "toolu_sleep", "done");
+          if (!queued) yield echo(options, steer);
+          yield assistantText(options, "FIRST");
+          yield result(options, {
+            user_message_uuid: first.uuid,
+            user_message_uuids: queued ? [first.uuid] : [first.uuid, steer.uuid],
+          });
+          yield idleState(options);
+          while (!(await input.next()).done);
+        };
+        const client = v2Client();
+        await client.app.connectWith(connectRouter(), async (agent) => {
+          await initializeV2(agent);
+          const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+          await agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: text("go") });
+          await atToolCall.promise;
+          const withdraw = new AbortController();
+          const steered = agent.request(
+            v2.methods.agent.session.prompt,
+            steerPrompt(sessionId, "never mind"),
+            { cancellationSignal: withdraw.signal },
+          );
+          // Settles the assertion below before `steered` is awaited.
+          steered.catch(() => {});
+          await vi.waitFor(() => expect(received).toHaveLength(2));
+          withdraw.abort();
+          await vi.waitFor(() => expect(dropped).toEqual([received[1].uuid]));
+          withdrawn.resolve();
+
+          if (queued) {
+            await expect(steered).rejects.toMatchObject({ code: -32800 });
+          } else {
+            expect(await steered).toEqual({ messageId: received[1].uuid });
+          }
+          await vi.waitFor(() =>
+            expect(turnTrace(client.sessionUpdates)).toContain("idle end_turn"),
+          );
+          await client.authUpdate(1);
+        });
+
+        expect(client.updates("user_message").map((update) => update.messageId)).toEqual(
+          queued ? [received[0].uuid] : [received[0].uuid, received[1].uuid],
+        );
+        expect(turnTrace(client.sessionUpdates).filter((s) => s.startsWith("idle"))).toEqual([
+          "idle end_turn",
+        ]);
+      },
+    );
+
+    it.each([["queue"], ["now"], [1]])(
+      "rejects delivery %j with invalid params before inserting the prompt",
+      async (delivery) => {
+        const echoed = scriptTurns();
+        const { app, authUpdate } = v2Client();
+        await app.connectWith(connectRouter(), async (agent) => {
+          await initializeV2(agent);
+          const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+          await expect(
+            agent.request(v2.methods.agent.session.prompt, {
+              sessionId,
+              prompt: text("hi"),
+              delivery,
+            } as v2.PromptRequest),
+          ).rejects.toMatchObject({ code: -32602 });
+          await authUpdate(1);
+        });
+        expect(echoed).toEqual([]);
+      },
+    );
   });
 });
 

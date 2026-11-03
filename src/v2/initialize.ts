@@ -16,6 +16,7 @@ import {
 import * as v2 from "@agentclientprotocol/sdk/experimental/v2/unstable";
 import { AIR_ASYNC_TASKS_CAPABILITY, AIR_GOAL_KEY } from "../air-extension.js";
 import { SYSTEM_PROMPT_CAPABILITY } from "../client-system-prompt.js";
+import { PROMPT_DELIVERY_CAPABILITY } from "./prompt-delivery.js";
 
 /** The v1 `initialize` request that a v2 client means. */
 export function v1InitializeRequest(request: v2.InitializeRequest): InitializeRequest {
@@ -134,9 +135,15 @@ function asRecord(value: unknown): Record<string, unknown> {
  *   lists: images, embedded context, and HTTP servers. Stdio servers are in the
  *   v1 baseline; v2 has no SSE transport.
  * - `systemPrompt`, in `append` and `override` mode.
+ * - `prompt.delivery.steer` (see `prompt-delivery.ts`), which the SDK's
+ *   `PromptCapabilities` type does not have yet.
  */
 export const V2_SESSION_CAPABILITIES: v2.SessionCapabilities = {
-  prompt: { image: {}, embeddedContext: {} },
+  prompt: {
+    image: {},
+    embeddedContext: {},
+    delivery: PROMPT_DELIVERY_CAPABILITY,
+  } as v2.PromptCapabilities,
   mcp: { stdio: {}, http: {} },
   delete: {},
   fork: {},
