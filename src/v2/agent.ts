@@ -22,6 +22,7 @@ import { stateUpdate, V2Background } from "./background.js";
 import { v1InitializeRequest, v2InitializeResponse } from "./initialize.js";
 import { v1PermissionResponse, v2PermissionRequest } from "./permission.js";
 import { v2Foreground, v2Prompt } from "./prompt.js";
+import { PromptDeliveries, withPromptDeliveries } from "./prompt-delivery.js";
 import {
   v1ForkSessionRequest,
   v1NewSessionRequest,
@@ -45,14 +46,18 @@ import { v2RestartedToolCall } from "./tool-call.js";
  * `onAgent` receives it for the owner of the process (shutdown).
  *
  * The provider methods pass through: their types are the same in v1 and v2.
+ *
+ * `session/prompt` also takes `delivery`, which the SDK does not parse yet
+ * (see `prompt-delivery.ts`).
  */
 export function v2AgentApp(
   logger: Logger | undefined,
   onAgent: (agent: ClaudeAcpAgent) => void,
-): v2.AgentApp {
+): v2.AgentConnector {
   let agent!: ClaudeAcpAgent;
   let client!: V2ClientConnection;
-  return v2
+  const deliveries = new PromptDeliveries();
+  const app = v2
     .agent({ name: "claude-code-acp" })
     .onConnect((connection) => {
       client = new V2ClientConnection(connection.client, logger ?? console);
@@ -172,10 +177,15 @@ export function v2AgentApp(
       });
       return { ...response, configOptions: options };
     })
-    .onRequest(v2.methods.agent.session.prompt, ({ params }) =>
-      v2Prompt(agent, params, (update) => {
-        void client.send({ sessionId: params.sessionId, update });
-      }),
+    .onRequest(v2.methods.agent.session.prompt, ({ params, requestId }) =>
+      v2Prompt(
+        agent,
+        params,
+        (update) => {
+          void client.send({ sessionId: params.sessionId, update });
+        },
+        deliveries.take(requestId),
+      ),
     )
     .onRequest(v2.methods.agent.terminal.cancel, async ({ params }) => {
       await agent.cancelBackgroundTerminal(params);
@@ -186,6 +196,7 @@ export function v2AgentApp(
       return {};
     })
     .onNotification(v2.methods.agent.session.cancel, ({ params }) => agent.cancel(params));
+  return withPromptDeliveries(app, deliveries);
 }
 
 /**

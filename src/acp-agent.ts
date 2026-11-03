@@ -57,6 +57,7 @@ import {
   ToolCallContent,
 } from "@agentclientprotocol/sdk/unstable";
 import type { ForegroundEvents, StopReason, TurnEvents, TurnOutcome } from "./turn-events.js";
+import { type PendingSteer, SteerInsertions } from "./steer-insertions.js";
 import {
   AccountInfo,
   AgentInfo,
@@ -737,6 +738,13 @@ function parseAsyncTaskStopRequest(value: unknown): AsyncTaskStopRequest {
  *  ACP request and hiding the client's user-input card (IJAI-1191). */
 const STEER_PRIORITY_NOW = "now" as const;
 const STEER_PRIORITY_LATER = "later" as const;
+/** `next` waits for the running tool calls to finish, then joins the turn
+ *  before its next model request, as a message typed in Claude Code while it
+ *  works does. ACP v2 `delivery: "steer"` uses it: the steer RFD forbids
+ *  cancelling tool calls that already started, which `now` can do. */
+const STEER_PRIORITY_NEXT = "next" as const;
+type SteerPriority =
+  typeof STEER_PRIORITY_NOW | typeof STEER_PRIORITY_NEXT | typeof STEER_PRIORITY_LATER;
 
 /** Request-level steering options. `promptRequired` is opt-in so existing Hosts
  *  keep the established idle fallback behavior. */
@@ -2859,6 +2867,8 @@ export class ClaudeAcpAgent {
     string,
     { owner: ForegroundOwner; events: ForegroundEvents; awaitingUser: boolean }
   >();
+  /** ACP v2 steers that Claude Code has not taken in yet (see `steerTurn`). */
+  private readonly steerInsertions = new SteerInsertions();
   /** The session index (docs/air-extensions.md, "Session index"). */
   private readonly sessionIndex = new sessionIndex.SessionIndexConnection({
     agent: this,
@@ -4124,11 +4134,13 @@ export class ClaudeAcpAgent {
       resolve: (outcome) => {
         this.endForeground(params.sessionId, turn, { outcome });
         events.ended(outcome);
+        this.restartPendingSteers(params.sessionId, turn);
         completeTurn();
       },
       reject: (error) => {
         this.endForeground(params.sessionId, turn, { error });
         events.failed(error);
+        this.restartPendingSteers(params.sessionId, turn);
         completeTurn();
       },
     };
@@ -4557,15 +4569,7 @@ export class ClaudeAcpAgent {
    *  `startedNewTurn` result are preserved for compatibility. */
   async steer(params: SteerRequest): Promise<SteerResponse> {
     const sessionId = params.sessionId;
-    let session = this.sessions[sessionId];
-    if (!session) {
-      throw RequestError.sessionNotFound(sessionId);
-    }
-    const signOutRespawn = this.respawnSignedOutSession(sessionId, session);
-    if (signOutRespawn) session = await signOutRespawn;
-    if (session.queryClosed) {
-      throw RequestError.internalError(undefined, SESSION_ENDED_MESSAGE);
-    }
+    const session = await this.steerableSession(sessionId);
 
     // "A turn is running" = the queue holds an unsettled turn. This covers both
     // the activated turn and one just submitted but not yet echoed/activated,
@@ -4599,23 +4603,93 @@ export class ClaudeAcpAgent {
       return { outcome: "startedNewTurn" };
     }
 
-    const promptRequest: PromptRequest = {
+    await this.injectSteer(
       sessionId,
-      prompt: params.prompt,
-    };
-    const userMessage = promptToClaude(promptRequest);
+      session,
+      turnInFlight,
+      { sessionId, prompt: params.prompt },
+      (session.openUserInputs?.size ?? 0) > 0 ? STEER_PRIORITY_LATER : STEER_PRIORITY_NOW,
+    );
+    return { outcome: "injected" };
+  }
+
+  /**
+   * Serves an ACP v2 `session/prompt` with `delivery: "steer"` (RFD
+   * agentclientprotocol/agent-client-protocol#1261): `params` joins the running
+   * turn and reports through `events` like a prompt, with `inserted` once
+   * Claude Code takes it in (see {@link SteerInsertions}).
+   *
+   * - A turn is running: the message is pushed into it at priority `next`, so
+   *   it waits for the running tool calls and goes in before the next model
+   *   request; `later` while a permission request or question is open, so the
+   *   steer does not withdraw it. The turn settles once a result answers the
+   *   steer (see `Turn.steeredEchoes`).
+   * - No turn is running: `params` starts one, as a prompt.
+   * - The turn ends before Claude Code takes the steer in (a cancel, or a
+   *   failure): the steer starts the next turn, as a prompt (see
+   *   {@link restartPendingSteers}).
+   */
+  async steerTurn(params: PromptRequest, events: TurnEvents): Promise<void> {
+    const sessionId = params.sessionId;
+    const session = await this.steerableSession(sessionId);
+    // Same check as `steer`, in the same synchronous section as the push.
+    const turnInFlight = (session.turnQueue ?? []).find((turn) => !turn.settled);
+    if (!turnInFlight) {
+      await this.startTurn(params, events);
+      return;
+    }
+    await this.injectSteer(
+      sessionId,
+      session,
+      turnInFlight,
+      params,
+      (session.openUserInputs?.size ?? 0) > 0 ? STEER_PRIORITY_LATER : STEER_PRIORITY_NEXT,
+      { request: params, events, turn: turnInFlight },
+    );
+  }
+
+  /** The live session `sessionId` to steer, respawned if it was signed out. */
+  private async steerableSession(sessionId: string): Promise<Session> {
+    let session = this.sessions[sessionId];
+    if (!session) {
+      throw RequestError.sessionNotFound(sessionId);
+    }
+    const signOutRespawn = this.respawnSignedOutSession(sessionId, session);
+    if (signOutRespawn) session = await signOutRespawn;
+    if (session.queryClosed) {
+      throw RequestError.internalError(undefined, SESSION_ENDED_MESSAGE);
+    }
+    return session;
+  }
+
+  /**
+   * Pushes `request` into `turnInFlight` as a steered user message at
+   * `priority`. The caller has checked, in the same synchronous section, that
+   * the turn is unsettled. `pending` tracks a steer that reports when Claude
+   * Code takes it in (ACP v2); it is tracked before the push, so no echo can
+   * come first.
+   */
+  private async injectSteer(
+    sessionId: string,
+    session: Session,
+    turnInFlight: Turn,
+    request: PromptRequest,
+    priority: SteerPriority,
+    pending?: PendingSteer,
+  ): Promise<void> {
+    const userMessage = promptToClaude({ sessionId, prompt: request.prompt });
     const steeredUuid = randomUUID();
     userMessage.uuid = steeredUuid;
     // Deliver into the running turn rather than queuing behind it as a fresh
     // prompt would.
-    userMessage.priority =
-      (session.openUserInputs?.size ?? 0) > 0 ? STEER_PRIORITY_LATER : STEER_PRIORITY_NOW;
+    userMessage.priority = priority;
     // Mark before the push and in the same synchronous section as the in-flight
     // check: the interrupt can have the CLI finalizing the aborted cycle by the
     // time the consumer next runs, and an unmarked result would settle the turn
     // (see Turn.steeredEchoes).
     (turnInFlight.steeredEchoes ??= new Set()).add(steeredUuid);
     (turnInFlight.steeredUuids ??= new Set()).add(steeredUuid);
+    if (pending) this.steerInsertions.track(steeredUuid, pending);
     // A turn already held for background subagents has a recorded outcome the
     // steer supersedes: move it into the steer lane so one lane owns settlement.
     // The idle handler re-applies the hold through the subagent gate.
@@ -4627,9 +4701,41 @@ export class ClaudeAcpAgent {
     }
     (session.sentUserUuids ??= new Set()).add(steeredUuid);
     session.input.push(userMessage);
-    const firstText = params.prompt[0]?.type === "text" ? params.prompt[0].text : "";
+    const firstText = request.prompt[0]?.type === "text" ? request.prompt[0].text : "";
     await this.publishGoalFromPrompt(sessionId, firstText, steeredUuid);
-    return { outcome: "injected" };
+  }
+
+  /**
+   * Starts the steers that `turn` ended without Claude Code taking in (see
+   * {@link SteerInsertions}) as the next turns, in the order they were sent:
+   * the steer RFD has waiting steers start the next turn, also after
+   * `session/cancel`. Called when the turn settles; the turns start after the
+   * caller returns, since turn events must not call back into the agent.
+   *
+   * Each steer is first dropped from Claude Code's queue, so that it does not
+   * run twice. A cancel already dropped it (see `cancelTurns`); dropping it
+   * again does nothing. A steer that Claude Code dequeued before the drop can
+   * still run: it is then not reported as this prompt's message.
+   */
+  private restartPendingSteers(sessionId: string, turn: Turn): void {
+    const steers = this.steerInsertions.takeForTurn(turn);
+    if (steers.length === 0) return;
+    const session = this.sessions[sessionId];
+    if (session && !session.queryClosed) {
+      this.dropQueuedMessages(
+        sessionId,
+        session.query,
+        steers.map(([uuid]) => uuid),
+      );
+    }
+    let started = Promise.resolve();
+    for (const [, steer] of steers) {
+      // `startTurn` resolves once the turn is queued, so chaining keeps the
+      // steers' order in the turn queue.
+      started = started.then(() =>
+        this.startTurn(steer.request, steer.events).catch((error) => steer.events.failed(error)),
+      );
+    }
   }
 
   async stopAsyncTask(params: AsyncTaskStopRequest): Promise<AsyncTaskStopResponse> {
@@ -6150,6 +6256,9 @@ export class ClaudeAcpAgent {
                 const active = session.activeTurn;
                 if (!active || active.settled || active === queued) reportInserted(queued);
               }
+              // A steer has no turn of its own: "started" means Claude Code
+              // took it into the running turn (see SteerInsertions).
+              this.steerInsertions.inserted(frame.command_uuid);
               // ...and promote an already-orphaned command: once dispatched,
               // a bare `cancelled` no longer means "dropped without running".
               const state = session.orphanCommands?.get(frame.command_uuid);
@@ -7202,6 +7311,9 @@ export class ClaudeAcpAgent {
                     (message.user_message_uuid !== undefined ? [message.user_message_uuid] : []);
                   let answersSteer = false;
                   for (const uuid of consumed) {
+                    // A CLI that replayed no echo for the steer reports it
+                    // taken in here (see SteerInsertions).
+                    this.steerInsertions.inserted(uuid);
                     steeredTurn.steeredEchoes.delete(uuid);
                     if (steeredTurn.steeredUuids?.has(uuid)) answersSteer = true;
                   }
@@ -8220,6 +8332,9 @@ export class ClaudeAcpAgent {
                 ) {
                   session.activeTurn.steeredAwaitingResult = true;
                 }
+                // The echo of an ACP v2 steer reports it taken in (see
+                // SteerInsertions).
+                this.steerInsertions.inserted(message.uuid);
                 // A message typed in another client of the session (Remote
                 // Control from claude.ai or the mobile app). The adapter's own
                 // prompts and steers are stamped human too, so they are told

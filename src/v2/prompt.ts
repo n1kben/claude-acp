@@ -15,6 +15,7 @@ import * as v2 from "@agentclientprotocol/sdk/experimental/v2/unstable";
 import type { ClaudeAcpAgent } from "../acp-agent.js";
 import { isSupportedBlobMimeType } from "../blob-resources.js";
 import type { ForegroundEvents, StopReason, TurnEvents, TurnOutcome } from "../turn-events.js";
+import { parsePromptDelivery } from "./prompt-delivery.js";
 
 /**
  * Starts a turn for `params`, and answers when Claude Code takes the prompt
@@ -27,11 +28,17 @@ import type { ForegroundEvents, StopReason, TurnEvents, TurnOutcome } from "../t
  *   {@link v2Foreground}).
  * - Ended or failed before it was taken in: the answer is a JSON-RPC error,
  *   `-32800` for a prompt that a cancel ended in the queue.
+ *
+ * `delivery` is the request's raw `delivery` field (see `prompt-delivery.ts`).
+ * With `steer`, the prompt joins the running turn instead of starting its own
+ * (see `ClaudeAcpAgent.steerTurn`), and answers the same way: once Claude
+ * Code takes it in, with its `user_message` first.
  */
 export function v2Prompt(
   agent: ClaudeAcpAgent,
   params: v2.PromptRequest,
   send: (update: v2.SessionUpdate) => void,
+  delivery?: unknown,
 ): Promise<v2.PromptResponse> {
   return new Promise((resolve, reject) => {
     let inserted = false;
@@ -57,13 +64,15 @@ export function v2Prompt(
       },
     };
     let request: PromptRequest;
+    let steer: boolean;
     try {
+      steer = parsePromptDelivery(delivery) === "steer";
       request = v1PromptRequest(params);
     } catch (error) {
       reject(error);
       return;
     }
-    agent.startTurn(request, events).catch(reject);
+    (steer ? agent.steerTurn(request, events) : agent.startTurn(request, events)).catch(reject);
   });
 }
 
