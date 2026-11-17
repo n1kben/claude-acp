@@ -21790,6 +21790,68 @@ describe("output after a cancel", () => {
     return { prompt, consumer: agent.sessions["test-session"]!.consumer };
   }
 
+  /** The PreToolUse hook that marks the call `id` started, as Claude Code calls it. */
+  const startTool = (
+    agent: ClaudeAcpAgent,
+    id: string,
+    name: string,
+    input: Record<string, unknown>,
+  ) =>
+    (agent as unknown as { toolStartHook(sessionId: string): HookCallback }).toolStartHook(
+      "test-session",
+    )(
+      {
+        hook_event_name: "PreToolUse",
+        tool_name: name,
+        tool_input: input,
+        tool_use_id: id,
+        session_id: "test-session",
+        transcript_path: "",
+        cwd: "/workspace/proj",
+      } as any,
+      id,
+      { signal: new AbortController().signal },
+    );
+
+  it.each([
+    ["after the whole message", true],
+    ["before the whole message", false],
+  ] as const)(
+    "marks a tool call in_progress with its whole input when Claude Code runs it, %s",
+    async (_when, messageFirst) => {
+      const input = { command: "npm test", description: "Run unit tests" };
+      const { agent, updates } = setup((stream) =>
+        (async function* () {
+          const iter = stream[Symbol.asyncIterator]();
+          const { value: prompt } = await iter.next();
+          yield* startTurn(prompt);
+          yield* toolUseStart("toolu_run", "Bash");
+          if (messageFirst) yield* toolUseMessage("toolu_run", "Bash", input);
+          await startTool(agent, "toolu_run", "Bash", input);
+          if (!messageFirst) yield* toolUseMessage("toolu_run", "Bash", input);
+          yield toolResult("toolu_run", "ok");
+          yield stampedResult(prompt.uuid);
+          yield idle;
+        })(),
+      );
+      await agent.prompt({
+        sessionId: "test-session",
+        prompt: [{ type: "text", text: "test it" }],
+      });
+      const calls = updates.filter(
+        (u) =>
+          (u.sessionUpdate === "tool_call" || u.sessionUpdate === "tool_call_update") &&
+          u.toolCallId === "toolu_run",
+      ) as any[];
+      const statuses = calls.map((u) => u.status).filter(Boolean);
+      expect(statuses).toEqual(["pending", "in_progress", "completed"]);
+      // When it goes in_progress, the client holds the whole input.
+      const started = calls.findIndex((u) => u.status === "in_progress");
+      const held = Object.assign({}, ...calls.slice(0, started + 1).map((u) => u.rawInput ?? {}));
+      expect(held).toEqual(input);
+    },
+  );
+
   it("answers a cancelled prompt at its interrupted result and delivers the follow-up that Claude Code runs next", async () => {
     const cancelled = Promise.withResolvers<void>();
     const answered = Promise.withResolvers<void>();
