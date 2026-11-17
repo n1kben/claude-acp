@@ -25050,7 +25050,20 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
       sessionId: "test-session",
       prompt: [{ type: "text", text: "explore" }],
     });
-    await waitFor(() => !!agent.sessions["test-session"]?.activeTurn?.deferredSettle);
+    // Cancel only once the consumer has taken the followup's `running`. The
+    // turn is held from its result on, but the consumer may not have read the
+    // trailer idle and the `running` after it yet: a cancel then sees turn 1's
+    // own stale `running` and the result's unpaid trailer, and the followup's
+    // `running` sweeps that debt, so the lagged idle below false-fails turn 2.
+    // The trailer paid and the session running again is the followup.
+    await waitFor(() => {
+      const session = agent.sessions["test-session"];
+      return (
+        !!session?.activeTurn?.deferredSettle &&
+        session.owedTrailingIdles === 0 &&
+        session.lastSessionState === "running"
+      );
+    });
     await agent.cancel({ sessionId: "test-session" });
     // The followup is live, so the turn ends at the interrupt's trailer, or,
     // as here where that trailer lags, at the next prompt's echo.
