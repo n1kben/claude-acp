@@ -20,6 +20,7 @@
 {"kind":"notification","method":"session/update","payload":{"sessionId":"agent_1","update":{"command":"rg parser","sessionUpdate":"terminal_update","terminalId":"toolu_sub_bash"}}}
 {"kind":"notification","method":"session/update","payload":{"sessionId":"agent_1","update":{"rawInput":{"command":"rg parser"},"sessionUpdate":"tool_call_update","title":"rg parser","toolCallId":"toolu_sub_bash"}}}
 {"kind":"notification","method":"session/update","payload":{"sessionId":"agent_1","update":{"rawInput":{"command":"rg parser","description":"Search"},"sessionUpdate":"tool_call_update","toolCallId":"toolu_sub_bash"}}}
+{"kind":"notification","method":"session/update","payload":{"sessionId":"agent_1","update":{"sessionUpdate":"tool_call_update","status":"in_progress","toolCallId":"toolu_sub_bash"}}}
 {"kind":"notification","method":"session/update","payload":{"sessionId":"<session>","update":{"sessionId":"agent_1","sessionUpdate":"subagent_update","state":{"background":[],"state":"requires_action"}}}}
 {"kind":"notification","method":"session/update","payload":{"sessionId":"agent_1","update":{"background":[],"sessionUpdate":"state_update","state":"requires_action"}}}
 {"kind":"notification","method":"session/update","payload":{"sessionId":"<session>","update":{"background":[],"sessionUpdate":"state_update","state":"requires_action"}}}
@@ -34,6 +35,7 @@
 {"kind":"notification","method":"session/update","payload":{"sessionId":"agent_1","update":{"locations":[{"path":"<cwd>/x.ts"}],"rawInput":{"file_path":"<cwd>/x.ts"},"sessionUpdate":"tool_call_update","title":"Edit x.ts","toolCallId":"toolu_sub_edit"}}}
 {"kind":"notification","method":"session/update","payload":{"sessionId":"agent_1","update":{"rawInput":{"file_path":"<cwd>/x.ts","old_string":"a"},"sessionUpdate":"tool_call_update","toolCallId":"toolu_sub_edit"}}}
 {"kind":"notification","method":"session/update","payload":{"sessionId":"agent_1","update":{"rawInput":{"file_path":"<cwd>/x.ts","new_string":"b","old_string":"a"},"sessionUpdate":"tool_call_update","toolCallId":"toolu_sub_edit"}}}
+{"kind":"notification","method":"session/update","payload":{"sessionId":"agent_1","update":{"sessionUpdate":"tool_call_update","status":"in_progress","toolCallId":"toolu_sub_edit"}}}
 {"kind":"notification","method":"session/update","payload":{"sessionId":"<session>","update":{"sessionId":"agent_1","sessionUpdate":"subagent_update","state":{"background":[],"state":"requires_action"}}}}
 {"kind":"notification","method":"session/update","payload":{"sessionId":"agent_1","update":{"background":[],"sessionUpdate":"state_update","state":"requires_action"}}}
 {"kind":"notification","method":"session/update","payload":{"sessionId":"<session>","update":{"background":[],"sessionUpdate":"state_update","state":"requires_action"}}}

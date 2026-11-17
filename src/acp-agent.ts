@@ -10918,6 +10918,66 @@ export class ClaudeAcpAgent {
     };
   }
 
+  /**
+   * The PreToolUse hook that marks a tool call `in_progress` when Claude Code
+   * is about to run it. The call goes out `pending` when its tool use starts
+   * to stream, before its input is written; without this a client can't tell
+   * a call being written from one that runs. Claude Code runs the hook after
+   * the input is complete and before the permission check, so a call that
+   * then waits on a permission request also reads as `in_progress`. A
+   * failure only leaves the status out.
+   */
+  private toolStartHook(sessionId: string): HookCallback {
+    return async (input, toolUseID, { signal }) => {
+      if (input.hook_event_name === "PreToolUse" && toolUseID) {
+        await this.markToolCallStarted(sessionId, input, toolUseID, signal).catch((error) =>
+          this.logger.error(`Session ${sessionId}: failed to mark ${toolUseID} started: ${error}`),
+        );
+      }
+      return { continue: true };
+    };
+  }
+
+  private async markToolCallStarted(
+    sessionId: string,
+    input: PreToolUseHookInput,
+    toolUseID: string,
+    signal: AbortSignal,
+  ): Promise<void> {
+    const session = this.sessions[sessionId];
+    if (!session) return;
+    // As in `canUseTool`: the work a cancel stopped shows nothing.
+    const stopped = this.isStoppedWorkToolUse(session, toolUseID, signal);
+    if (stopped instanceof Promise ? await stopped : stopped) return;
+    // Only a call the client holds: TodoWrite, the Task* tools and native
+    // subagent control calls never go out as one. The hook bypasses the
+    // stream, so it can also come before the streamed tool_use; that call
+    // then goes from `pending` to its end.
+    if (!session.emittedToolCalls.has(toolUseID)) return;
+    const { parentToolUseId, toolCallSessionId } = this.toolUseOwner(
+      session,
+      sessionId,
+      input.agent_id,
+    );
+    // The complete input goes along: Claude Code can run a tool before it
+    // sends the whole message that refines the call with it.
+    const update: SessionNotification["update"] = {
+      sessionUpdate: "tool_call_update",
+      toolCallId: toolUseID,
+      status: "in_progress",
+      rawInput: input.tool_input ?? {},
+    };
+    if (parentToolUseId) stampParentToolUseId(update, parentToolUseId);
+    // The field tracker drops the fields the client already holds: the input
+    // when the whole message came first, the status after a progress beat.
+    if (!toolCallFieldsOf(session).apply(update)) return;
+    if (session.nativeSubagentDeliver) {
+      await session.nativeSubagentDeliver({ sessionId, update });
+    } else {
+      await this.client.sessionUpdate({ sessionId: toolCallSessionId, update });
+    }
+  }
+
   private async previewFileChange(
     sessionId: string,
     input: PreToolUseHookInput,
@@ -12434,14 +12494,18 @@ export class ClaudeAcpAgent {
           : {}),
         // On v2, an Edit or Write shows its exact patch before it runs, also
         // when no permission request shows it (`fileChangePreviewHook`): a v2
-        // diff cannot hold the input's snippet.
+        // diff cannot hold the input's snippet. And every tool call goes
+        // `in_progress` as it starts to run (`toolStartHook`).
         ...(this.v2 || subagentConfigHook
           ? {
               PreToolUse: [
                 ...(userProvidedOptions?.hooks?.PreToolUse || []),
                 ...(subagentConfigHook ? [{ hooks: [subagentConfigHook] }] : []),
                 ...(this.v2
-                  ? [{ matcher: "Edit|Write", hooks: [this.fileChangePreviewHook(sessionId)] }]
+                  ? [
+                      { matcher: "Edit|Write", hooks: [this.fileChangePreviewHook(sessionId)] },
+                      { hooks: [this.toolStartHook(sessionId)] },
+                    ]
                   : []),
               ],
             }

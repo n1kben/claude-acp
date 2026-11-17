@@ -21,6 +21,7 @@
 {"kind":"notification","method":"session/update","payload":{"sessionId":"agent_n","update":{"command":"make","sessionUpdate":"terminal_update","terminalId":"toolu_native_bash"}}}
 {"kind":"notification","method":"session/update","payload":{"sessionId":"agent_n","update":{"rawInput":{"command":"make"},"sessionUpdate":"tool_call_update","title":"make","toolCallId":"toolu_native_bash"}}}
 {"kind":"notification","method":"session/update","payload":{"sessionId":"agent_n","update":{"rawInput":{"command":"make","description":"Build"},"sessionUpdate":"tool_call_update","toolCallId":"toolu_native_bash"}}}
+{"kind":"notification","method":"session/update","payload":{"sessionId":"agent_n","update":{"sessionUpdate":"tool_call_update","status":"in_progress","toolCallId":"toolu_native_bash"}}}
 {"kind":"notification","method":"session/update","payload":{"sessionId":"<session>","update":{"sessionId":"agent_n","sessionUpdate":"subagent_update","state":{"background":[],"state":"requires_action"}}}}
 {"kind":"notification","method":"session/update","payload":{"sessionId":"agent_n","update":{"background":[],"sessionUpdate":"state_update","state":"requires_action"}}}
 {"kind":"notification","method":"session/update","payload":{"sessionId":"<session>","update":{"background":[],"sessionUpdate":"state_update","state":"requires_action"}}}

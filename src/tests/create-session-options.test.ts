@@ -176,7 +176,7 @@ describe("createSession options merging", () => {
     });
   });
 
-  it("registers the PreToolUse hook of the change previews only on a v2 connection", async () => {
+  it("registers the PreToolUse hooks of the change previews and the tool start only on a v2 connection", async () => {
     await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
     // A v1 client gets the input's diff, so Claude Code waits on no hook.
     expect(capturedOptions!.hooks?.PreToolUse).toBeUndefined();
@@ -185,6 +185,7 @@ describe("createSession options merging", () => {
     await v2Agent.newSession({ cwd: process.cwd(), mcpServers: [] });
     expect(capturedOptions!.hooks?.PreToolUse).toEqual([
       { matcher: "Edit|Write", hooks: [expect.any(Function)] },
+      { hooks: [expect.any(Function)] },
     ]);
   });
 
