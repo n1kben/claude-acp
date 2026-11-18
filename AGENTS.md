@@ -106,7 +106,35 @@ to compute the next version. Titles must be conventional commits using one of:
 The title also decides the release: `feat:` bumps the minor, `fix:`/`perf:` the
 patch, and `chore:`/`ci:`/`test:` and friends do not release at all.
 
-## Releasing
+## Working on this fork
+
+No pull requests: commit on a branch and merge it straight to `main` (rebase, not
+squash), only after the user says to merge. Commit subjects still follow the
+conventional-commit types below.
+
+## Releasing this fork
+
+This is n1kben's fork; Parley installs it from a prebuilt tarball on a GitHub
+release. release-please and the npm preview publish below don't run here.
+
+Every fork release gets its own version: upstream's version with `-fork.N`
+(`0.100.0-fork.1`, then `-fork.2`, ...; back to `-fork.1` after merging a new
+upstream version). npm decides whether an installed package is current by its
+version, so a new tarball under an unchanged version is skipped by
+`npm install` and the consumer keeps running the old code.
+
+To release, once the change is merged to `main`:
+
+```sh
+npm version 0.100.0-fork.N --no-git-tag-version  # a commit of its own: `chore: release 0.100.0-fork.N`
+npm run build && npm pack                          # from the merged commit
+gh release create v0.100.0-fork.N --target <sha> \
+  --title "0.100.0-fork.N (<short sha>) prebuilt" agentclientprotocol-claude-agent-acp-0.100.0-fork.N.tgz
+```
+
+Then point Parley's `package.json` at the new release URL and run `npm install`.
+
+## Releasing (upstream)
 
 Stable releases are fully automated by release-please. There is no manual release
 workflow, and the version is never chosen by hand — it follows from the commit
